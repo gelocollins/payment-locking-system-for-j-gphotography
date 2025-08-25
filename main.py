@@ -12,159 +12,107 @@
 
 import serial
 import time
+import threading
 import sys
-from dataclasses import dataclass
+import select
 
-# ======= USER CONFIG =======
-COM_TP70 = "COM7"           # <-- change to your RS232-to-USB port for the TP70
-COM_ESP32 = None            # e.g. "COM5" if you want to also toggle an ESP32 (optional)
-TARGET_AMOUNT = 100         # amount that “unlocks” one session (change as you like)
-SESSION_TIMEOUT_S = 120     # cancel session if idle this long
+# Configuration
+COM_TP70 = "COM3"           # change to your TP70 port
+COM_ESP32 = None            # or e.g. "COM5" if using ESP32 relay
+TARGET_AMOUNT = 100         # amount to unlock
+SESSION_TIMEOUT = 60        # seconds
 
-# Bill mapping (RS232 104U codes -> pesos). Adjust if your TP70’s bill table differs.
-BILL_VALUE = {
-    0x40: 100,   # first bill type
-    0x41: 200,   # second bill type
-    # 0x42: 500, 
-    # 0x43: 1000,
-    # 0x44: 0,  
-}
-# ===========================
+BILL_CODES = {0x40: 100, 0x41: 200}  # TP70 bill codes
 
-# 104U protocol bytes
-ACCEPT = 0x02
+ACK = 0x02
 REJECT = 0x0F
-HOLD   = 0x18   # (escrow hold, not used here)
-POWER1 = 0x80   # BA -> host at power up
-POWER2 = 0x8F   # BA -> host at power up
-ESCROW = 0x81   # BA -> host “bill present” (will follow with 0x40..0x44)
-POLL   = 0x0C   # host -> BA “status” (optional)
+ESCROW = 0x81
+POWER1 = 0x80
+POWER2 = 0x8F
 
-@dataclass
-class Session:
-    amount: int = 0
-    last_activity: float = time.time()
-    active: bool = True
+session = {"amount":0, "last":time.time(), "active":False}
 
-def open_port(name):
-    return serial.Serial(
-        name,
-        baudrate=9600,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_EVEN,   # even parity per 104U spec
-        stopbits=serial.STOPBITS_ONE,
-        timeout=0.2
-    )
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
-def log(s): print(time.strftime("[%H:%M:%S]"), s)
+def open_port(port, baud=9600):
+    return serial.Serial(port, baudrate=baud, bytesize=8, parity=serial.PARITY_EVEN,
+                         stopbits=1, timeout=0.2)
 
 def unlock_action(esp):
-    log("==> UNLOCK event (target amount reached)")
+    log("=== UNLOCK TRIGGERED ===")
     if esp:
-        try:
-            esp.write(b"UNLOCK\n")
-            log("Sent UNLOCK to ESP32.")
-        except Exception as e:
-            log(f"ESP32 write error: {e}")
+        esp.write(b"UNLOCK\n")
 
-def relock_action(esp):
-    log("==> LOCK event (session ended)")
+def lock_action(esp):
+    log("=== LOCK TRIGGERED ===")
     if esp:
-        try:
-            esp.write(b"LOCK\n")
-            log("Sent LOCK to ESP32.")
-        except Exception as e:
-            log(f"ESP32 write error: {e}")
+        esp.write(b"LOCK\n")
+
+def process_tap(tp, esp):
+    b = tp.read(1)
+    if not b: return
+    c = b[0]
+    if c in (POWER1, POWER2):
+        log("TP70 power-up detected; sending ACK")
+        tp.write(bytes([ACK]))
+    elif c == ESCROW:
+        code = tp.read(1)
+        if not code: return
+        val = BILL_CODES.get(code[0])
+        log(f"ESCROW code 0x{code[0]:02X}, value={val}")
+        if val:
+            tp.write(bytes([ACK]))
+            session["amount"] += val
+            session["last"] = time.time()
+            session["active"] = True
+            log(f"Amount=₱{session['amount']}")
+            if session["amount"] >= TARGET_AMOUNT:
+                unlock_action(esp)
+        else:
+            tp.write(bytes([REJECT]))
+            log("Rejected unknown bill")
+    # else ignore other bytes
+
+def input_listener(tp, esp):
+    log("Type 'reset' to restart session.")
+    while True:
+        ready, *_ = select.select([sys.stdin], [], [], 1)
+        if ready:
+            cmd = sys.stdin.readline().strip().lower()
+            if cmd == 'reset':
+                session["amount"] = 0
+                session["active"] = False
+                session["last"] = time.time()
+                log("Session reset by user")
+                lock_action(esp)
 
 def main():
-    # Open TP70 serial
     try:
         tp = open_port(COM_TP70)
     except Exception as e:
-        print(f"Cannot open TP70 port {COM_TP70}: {e}")
-        sys.exit(1)
+        log(f"Error opening TP70 port: {e}")
+        return
 
-    # Open ESP32 serial (optional)
     esp = None
     if COM_ESP32:
         try:
-            esp = serial.Serial(COM_ESP32, 115200, timeout=0.2)
+            esp = open_port(COM_ESP32, baud=115200)
         except Exception as e:
-            log(f"Warning: cannot open ESP32 port {COM_ESP32}: {e}")
-            esp = None
+            log(f"ESP32 port error: {e}")
 
-    log(f"Connected to TP70 on {COM_TP70} (9600 8E1). Waiting for POWER-UP...")
-    sess = Session()
+    log("Ready. Waiting for bills...")
 
-    # On power-up the validator sends 0x80/0x8F and expects 0x02 within 2 seconds.
-    power_window = time.time() + 5
-    powered = False
+    threading.Thread(target=input_listener, args=(tp,esp), daemon=True).start()
 
     while True:
-        b = tp.read(1)
-        if b:
-            code = b[0]
-
-            # POWER-UP handshake
-            if code in (POWER1, POWER2):
-                log("Power-up from validator -> replying ACCEPT (enable).")
-                tp.write(bytes([ACCEPT]))
-                powered = True
-                continue
-
-            if code == ESCROW:
-                # Next byte should be bill type 0x40..0x44
-                denom = tp.read(1)
-                if not denom:
-                    log("ESCROW without denomination byte — ignoring.")
-                    continue
-
-                bill_code = denom[0]
-                value = BILL_VALUE.get(bill_code)
-                log(f"Bill in escrow: code 0x{bill_code:02X} -> value {value if value else 'UNKNOWN'}")
-
-                if value is None:
-                    # Unknown bill type — reject
-                    tp.write(bytes([REJECT]))
-                    log("Rejected (unknown bill code).")
-                    continue
-
-                # Accept the bill
-                tp.write(bytes([ACCEPT]))
-                log("Accept command sent. Waiting for stack…")
-
-                # The BA will send 0x10 (stacking) / 0x11 (reject) internally; we just update balance.
-                sess.amount += value
-                sess.last_activity = time.time()
-                log(f"Accumulated amount: ₱{sess.amount}")
-
-                # Check target
-                if sess.amount >= TARGET_AMOUNT:
-                    unlock_action(esp)
-                continue
-
-            # Optional: read error/status bytes when we poll (not strictly necessary)
-            # If you want, you can periodically send POLL and interpret responses here.
-
-        # Periodic tasks
-        now = time.time()
-
-        # If validator powered but no session activity and we want to keep it enabled,
-        # occasionally ping with POLL (not required, but keeps link warm).
-        if powered and int(now) % 3 == 0:
-            try:
-                tp.write(bytes([POLL]))
-            except Exception as e:
-                log(f"Write error: {e}")
-
-        # Timeout auto-cancel
-        if sess.active and (now - sess.last_activity) > SESSION_TIMEOUT_S and sess.amount > 0:
-            log(f"Session timeout after {SESSION_TIMEOUT_S}s. Cancelling and re-locking.")
-            sess = Session()  # reset
-            relock_action(esp)
-
-        # Small sleep to avoid busy loop
-        time.sleep(0.02)
+        process_tap(tp, esp)
+        if session["active"] and (time.time() - session["last"] > SESSION_TIMEOUT):
+            log("Session timeout. Resetting.")
+            session["amount"] = 0
+            session["active"] = False
+            lock_action(esp)
+        time.sleep(0.05)
 
 if __name__ == "__main__":
     main()
