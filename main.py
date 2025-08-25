@@ -5,7 +5,7 @@
 # // EMAIL: angeloqq03@gmail.com / gelocollins@icloud.com
 # // INSTAGRAM: https://www.instagram.com/angelocollinsrivera/
 # // CONTACT NO: 0931 871 3008 / 0992 438 7967
-# // PROJECT NAME: PAYMENT LOCKING SYSTEM FOR J-GPHOTOGRAPHY
+# // PROJECT NAME: PAYMENT LOCKING SYSTEM FOR J&G-GPHOTOGRAPHY
 # // PROJECT DESCRIPTION: This is a payment locking system for J-GPhotography. This system is used
 # // to lock the system if the user has not paid for the service. The system will be unlocked
 # // if the user has paid for the service. And, the system will be locked again after the photo is printed.
@@ -15,6 +15,19 @@ import time
 import threading
 import sys
 import select
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # Configuration
 COM_TP70 = "COM3"           # change to your TP70 port
@@ -72,7 +85,6 @@ def process_tap(tp, esp):
         else:
             tp.write(bytes([REJECT]))
             log("Rejected unknown bill")
-    # else ignore other bytes
 
 def input_listener(tp, esp):
     log("Type 'reset' to restart session.")
